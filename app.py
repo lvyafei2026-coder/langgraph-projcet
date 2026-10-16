@@ -2,14 +2,16 @@ import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse          # ← 新增
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles                 # ← 新增
 from pydantic import BaseModel
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from agent import build_graph
 
-# ---------- 新增：强制 UTF-8 的 JSON 响应类 ----------
+
+# ---------- 强制 UTF-8 响应 ----------
 class UTF8JSONResponse(JSONResponse):
     media_type = "application/json; charset=utf-8"
 
@@ -18,6 +20,7 @@ DB_PATH = "./checkpoints.db"
 
 checkpointer = None
 graph = None
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -28,17 +31,18 @@ async def lifespan(app: FastAPI):
         graph = build_graph(checkpointer)
         yield
 
-# ---------- 修改：指定 default_response_class ----------
+
 app = FastAPI(
     title="LangGraph Agent API",
     lifespan=lifespan,
-    default_response_class=UTF8JSONResponse,       # ← 关键一行
+    default_response_class=UTF8JSONResponse,
 )
 
 
 class ChatRequest(BaseModel):
     message: str
     thread_id: str
+
 
 class ChatResponse(BaseModel):
     thread_id: str
@@ -88,3 +92,7 @@ async def history(thread_id: str):
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+# ---------- 静态文件挂载（必须放最后） ----------
+app.mount("/", StaticFiles(directory="static", html=True), name="static")

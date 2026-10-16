@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LangGraph Agent</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.2); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: rgba(0,0,0,0.35); }
+  .typing::after { content: '...'; animation: dots 1.4s infinite; }
+  @keyframes dots {
+    0%, 20% { content: '.'; } 40% { content: '..'; } 60%, 100% { content: '...'; }
+  }
+</style>
+</head>
+<body class="h-screen overflow-hidden bg-gray-100 text-gray-900">
+<div class="flex h-full">
+
+  <!-- 侧边栏 -->
+  <aside class="w-64 bg-gray-900 text-gray-100 flex flex-col shrink-0">
+    <div class="p-4 border-b border-gray-800">
+      <h1 class="text-lg font-semibold">🤖 LangGraph Agent</h1>
+      <p class="text-xs text-gray-500 mt-1">DeepSeek · 短期记忆</p>
+    </div>
+    <div class="p-3">
+      <button onclick="newThread()" class="w-full bg-blue-600 hover:bg-blue-500 text-white text-sm py-2 rounded-lg transition">
+        + 新建会话
+      </button>
+    </div>
+    <div id="threadList" class="flex-1 overflow-y-auto px-2 pb-2"></div>
+    <div class="p-3 border-t border-gray-800 text-xs text-gray-500">
+      <div class="flex items-center gap-2">
+        <span id="statusDot" class="w-2 h-2 rounded-full bg-green-500"></span>
+        <span id="statusText">就绪</span>
+      </div>
+    </div>
+  </aside>
+
+  <!-- 主聊天区 -->
+  <main class="flex-1 flex flex-col min-w-0">
+    <header class="bg-white border-b px-6 py-4 flex items-center justify-between">
+      <div>
+        <h2 id="chatTitle" class="font-semibold">新会话</h2>
+        <p id="chatSubtitle" class="text-xs text-gray-500">thread_id: -</p>
+      </div>
+    </header>
+
+    <div id="messages" class="flex-1 overflow-y-auto px-6 py-4 space-y-4"></div>
+
+    <div class="bg-white border-t p-4">
+      <div class="max-w-4xl mx-auto flex gap-2 items-end">
+        <textarea id="input" rows="1"
+          class="flex-1 resize-none border border-gray-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 max-h-40"
+          placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
+        <button onclick="sendMessage()" id="sendBtn"
+          class="bg-blue-600 hover:bg-blue-500 text-white px-5 py-2 rounded-lg transition disabled:opacity-50 disabled:cursor-not-allowed">
+          发送
+        </button>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script>
+const STORAGE_KEY = 'langgraph_agent_threads';
+let threads = loadThreads();
+let currentThreadId = null;
+let isSending = false;
+
+document.addEventListener('DOMContentLoaded', () => {
+  renderThreads();
+  const input = document.getElementById('input');
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+  });
+  input.addEventListener('input', () => {
+    input.style.height = 'auto';
+    input.style.height = Math.min(input.scrollHeight, 160) + 'px';
+  });
+
+  if (threads.length === 0) newThread();
+  else selectThread(threads[0].id);
+});
+
+function loadThreads() {
+  try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'); }
+  catch { return []; }
+}
+function saveThreads() { localStorage.setItem(STORAGE_KEY, JSON.stringify(threads)); }
+
+function newThread() {
+  const id = 'user-' + Date.now();
+  threads.unshift({ id, title: '新会话', createdAt: Date.now() });
+  saveThreads(); renderThreads(); selectThread(id);
+}
+
+function selectThread(id) {
+  currentThreadId = id;
+  renderThreads();
+  const thread = threads.find(t => t.id === id);
+  document.getElementById('chatTitle').textContent = thread ? thread.title : '会话';
+  document.getElementById('chatSubtitle').textContent = 'thread_id: ' + id;
+  loadHistory(id);
+}
+
+function deleteThread(id, ev) {
+  ev.stopPropagation();
+  threads = threads.filter(t => t.id !== id);
+  saveThreads();
+  if (currentThreadId === id) {
+    if (threads.length === 0) newThread();
+    else selectThread(threads[0].id);
+  } else renderThreads();
+}
+
+function renderThreads() {
+  document.getElementById('threadList').innerHTML = threads.map(t => `
+    <div onclick="selectThread('${t.id}')"
+      class="group flex items-center justify-between px-3 py-2 rounded-lg cursor-pointer mb-1 text-sm
+        ${t.id === currentThreadId ? 'bg-gray-700 text-white' : 'hover:bg-gray-800 text-gray-300'}">
+      <span class="truncate">${escapeHtml(t.title)}</span>
+      <button onclick="deleteThread('${t.id}', event)"
+        class="opacity-0 group-hover:opacity-100 text-gray-400 hover:text-red-400 text-xs ml-2">✕</button>
+    </div>`).join('');
+}
+
+function clearMessages() { document.getElementById('messages').innerHTML = ''; }
+
+function showEmpty() {
+  document.getElementById('messages').innerHTML = `
+    <div class="h-full flex items-center justify-center text-gray-400 text-sm">
+      <div class="text-center">
+        <div class="text-5xl mb-4">💬</div>
+        <p>发送第一条消息开始对话</p>
+      </div>
+    </div>`;
+}
+
+function appendMessage(role, content, isLoading = false) {
+  const box = document.getElementById('messages');
+  const empty = box.querySelector('.h-full');
+  if (empty) empty.remove();
+
+  const id = 'msg-' + Math.random().toString(36).slice(2);
+  const isUser = role === 'user';
+  const div = document.createElement('div');
+  div.id = id;
+  div.className = `flex ${isUser ? 'justify-end' : 'justify-start'}`;
+  div.innerHTML = `
+    <div class="max-w-[75%] px-4 py-2 rounded-2xl shadow-sm whitespace-pre-wrap break-words
+      ${isUser ? 'bg-blue-600 text-white rounded-br-sm' : 'bg-white text-gray-900 rounded-bl-sm border'}">
+      <div class="text-sm leading-relaxed">
+        ${isLoading ? '<span class="typing">思考中</span>' : escapeHtml(content)}
+      </div>
+    </div>`;
+  box.appendChild(div);
+  box.scrollTop = box.scrollHeight;
+  return id;
+}
+
+function updateMessage(id, content) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.querySelector('.text-sm').innerHTML = escapeHtml(content);
+  const box = document.getElementById('messages');
+  box.scrollTop = box.scrollHeight;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+
+async function loadHistory(threadId) {
+  clearMessages();
+  try {
+    const res = await fetch(`/history/${encodeURIComponent(threadId)}`);
+    const data = await res.json();
+    if (!data.messages || data.messages.length === 0) { showEmpty(); return; }
+    data.messages.forEach(m => {
+      const role = m.role === 'HumanMessage' ? 'user' : 'assistant';
+      appendMessage(role, m.content);
+    });
+  } catch { showEmpty(); setStatus('err', '历史加载失败'); }
+}
+
+async function sendMessage() {
+  if (isSending) return;
+  const input = document.getElementById('input');
+  const text = input.value.trim();
+  if (!text) return;
+
+  isSending = true;
+  document.getElementById('sendBtn').disabled = true;
+  input.value = '';
+  input.style.height = 'auto';
+
+  appendMessage('user', text);
+  const loadingId = appendMessage('assistant', '', true);
+  setStatus('busy', '生成中...');
+
+  try {
+    const res = await fetch('/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json; charset=utf-8' },
+      body: JSON.stringify({ message: text, thread_id: currentThreadId })
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || `HTTP ${res.status}`);
+    }
+    const data = await res.json();
+    updateMessage(loadingId, data.reply);
+    setStatus('ok', '就绪');
+
+    const thread = threads.find(t => t.id === currentThreadId);
+    if (thread && thread.title === '新会话') {
+      thread.title = text.slice(0, 20) + (text.length > 20 ? '...' : '');
+      saveThreads(); renderThreads();
+      document.getElementById('chatTitle').textContent = thread.title;
+    }
+  } catch (e) {
+    updateMessage(loadingId, '❌ 请求失败: ' + e.message);
+    setStatus('err', '请求失败');
+  } finally {
+    isSending = false;
+    document.getElementById('sendBtn').disabled = false;
+    input.focus();
+  }
+}
+
+function setStatus(type, text) {
+  document.getElementById('statusText').textContent = text;
+  document.getElementById('statusDot').className = 'w-2 h-2 rounded-full ' + {
+    ok: 'bg-green-500',
+    busy: 'bg-yellow-500 animate-pulse',
+    err: 'bg-red-500'
+  }[type];
+}
+</script>
+</body>
+</html>
