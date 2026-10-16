@@ -4,4 +4,4 @@ langgraph==0.2.60
 langchain-core==0.3.29
 langgraph-checkpoint-sqlite==2.0.5
 aiosqlite==0.20.0
-langchain-openai==0.2.14
+langchain-openai>=0.3.0
