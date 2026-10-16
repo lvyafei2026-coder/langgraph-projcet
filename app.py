@@ -3,7 +3,7 @@ import json
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse          # ← 加 StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from langchain_core.messages import HumanMessage
@@ -17,7 +17,6 @@ class UTF8JSONResponse(JSONResponse):
 
 
 DB_PATH = "./checkpoints.db"
-
 checkpointer = None
 graph = None
 
@@ -71,7 +70,7 @@ async def chat(req: ChatRequest):
     )
 
 
-# ---------- 新增：SSE 流式输出 ----------
+# ---------- 流式输出：区分 reasoning_content 和 content ----------
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest):
     if graph is None:
@@ -84,11 +83,23 @@ async def chat_stream(req: ChatRequest):
                 config={"configurable": {"thread_id": req.thread_id}},
                 stream_mode="messages",
             ):
+                # ---- 提取思考过程 ----
+                reasoning = ""
+                if hasattr(chunk, "additional_kwargs"):
+                    reasoning = chunk.additional_kwargs.get("reasoning_content", "") or ""
+
+                if reasoning:
+                    payload = json.dumps({"type": "reasoning", "delta": reasoning}, ensure_ascii=False)
+                    yield f"data: {payload}\n\n"
+
+                # ---- 提取最终回答 ----
                 content = getattr(chunk, "content", "") or ""
                 if content:
-                    payload = json.dumps({"delta": content}, ensure_ascii=False)
+                    payload = json.dumps({"type": "content", "delta": content}, ensure_ascii=False)
                     yield f"data: {payload}\n\n"
+
             yield f"data: {json.dumps({'done': True})}\n\n"
+
         except Exception as e:
             payload = json.dumps({"error": str(e)}, ensure_ascii=False)
             yield f"data: {payload}\n\n"
@@ -99,12 +110,12 @@ async def chat_stream(req: ChatRequest):
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",          # 防止中间层缓冲（Render 上很关键）
+            "X-Accel-Buffering": "no",
         },
     )
 
 
-# ---------- 原接口：历史 ----------
+# ---------- 历史查询：同时返回 reasoning_content ----------
 @app.get("/history/{thread_id}")
 async def history(thread_id: str):
     if graph is None:
@@ -115,16 +126,23 @@ async def history(thread_id: str):
     if not state.values or "messages" not in state.values:
         return {"thread_id": thread_id, "messages": []}
 
-    return {
-        "thread_id": thread_id,
-        "messages": [
-            {"role": m.__class__.__name__, "content": m.content}
-            for m in state.values["messages"]
-        ],
-    }
+    messages = []
+    for m in state.values["messages"]:
+        item = {
+            "role": m.__class__.__name__,
+            "content": m.content,
+        }
+        # 从 additional_kwargs 中提取思考过程
+        if hasattr(m, "additional_kwargs"):
+            item["reasoning_content"] = m.additional_kwargs.get("reasoning_content", "") or ""
+        else:
+            item["reasoning_content"] = ""
+        messages.append(item)
+
+    return {"thread_id": thread_id, "messages": messages}
 
 
-# ---------- 新增：删除会话 ----------
+# ---------- 删除会话 ----------
 @app.delete("/threads/{thread_id}")
 async def delete_thread(thread_id: str):
     if checkpointer is None:
@@ -146,5 +164,4 @@ async def health():
     return {"status": "ok"}
 
 
-# ---------- 静态资源（必须最后挂载） ----------
 app.mount("/", StaticFiles(directory="static", html=True), name="static")
