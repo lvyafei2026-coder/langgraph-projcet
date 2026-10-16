@@ -5,24 +5,61 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>LangGraph Agent</title>
 <script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = { darkMode: 'class' };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
 <style>
   ::-webkit-scrollbar { width: 6px; height: 6px; }
   ::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.2); border-radius: 3px; }
+  html.dark ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); }
   ::-webkit-scrollbar-thumb:hover { background: rgba(0,0,0,0.35); }
+
   .typing::after { content: '...'; animation: dots 1.4s infinite; }
   @keyframes dots {
     0%, 20% { content: '.'; } 40% { content: '..'; } 60%, 100% { content: '...'; }
   }
+
+  /* Markdown 样式 */
+  .markdown-body p { margin: 0.25rem 0; }
+  .markdown-body p:first-child { margin-top: 0; }
+  .markdown-body p:last-child { margin-bottom: 0; }
+  .markdown-body pre {
+    background: #1e293b; color: #e2e8f0;
+    padding: 0.75rem; border-radius: 0.5rem;
+    overflow-x: auto; font-size: 0.8rem; margin: 0.5rem 0;
+  }
+  .markdown-body code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85em; }
+  .markdown-body code:not(pre code) {
+    background: rgba(0,0,0,0.08); padding: 0.1em 0.35em; border-radius: 0.25rem;
+  }
+  html.dark .markdown-body code:not(pre code) { background: rgba(255,255,255,0.12); }
+  .markdown-body ul, .markdown-body ol { padding-left: 1.25rem; margin: 0.25rem 0; }
+  .markdown-body ul { list-style: disc; }
+  .markdown-body ol { list-style: decimal; }
+  .markdown-body h1, .markdown-body h2, .markdown-body h3 { font-weight: 600; margin: 0.6rem 0 0.3rem; }
+  .markdown-body h1 { font-size: 1.1rem; }
+  .markdown-body h2 { font-size: 1rem; }
+  .markdown-body h3 { font-size: 0.95rem; }
+  .markdown-body a { color: #2563eb; text-decoration: underline; }
+  html.dark .markdown-body a { color: #60a5fa; }
+  .markdown-body blockquote {
+    border-left: 3px solid #cbd5e1; padding-left: 0.75rem; color: #64748b; margin: 0.5rem 0;
+  }
+  html.dark .markdown-body blockquote { border-color: #475569; color: #94a3b8; }
 </style>
 </head>
-<body class="h-screen overflow-hidden bg-gray-100 text-gray-900">
+<body class="h-screen overflow-hidden bg-gray-100 text-gray-900 dark:bg-gray-900 dark:text-gray-100">
 <div class="flex h-full">
 
   <!-- 侧边栏 -->
-  <aside class="w-64 bg-gray-900 text-gray-100 flex flex-col shrink-0">
-    <div class="p-4 border-b border-gray-800">
-      <h1 class="text-lg font-semibold">🤖 LangGraph Agent</h1>
-      <p class="text-xs text-gray-500 mt-1">DeepSeek · 短期记忆</p>
+  <aside class="w-64 bg-gray-900 text-gray-100 flex flex-col shrink-0 dark:bg-black">
+    <div class="p-4 border-b border-gray-800 flex items-center justify-between">
+      <div>
+        <h1 class="text-lg font-semibold">🤖 LangGraph</h1>
+        <p class="text-xs text-gray-500 mt-1">DeepSeek · 短期记忆</p>
+      </div>
     </div>
     <div class="p-3">
       <button onclick="newThread()" class="w-full bg-blue-600 hover:bg-blue-500 text-white text-sm py-2 rounded-lg transition">
@@ -40,19 +77,23 @@
 
   <!-- 主聊天区 -->
   <main class="flex-1 flex flex-col min-w-0">
-    <header class="bg-white border-b px-6 py-4 flex items-center justify-between">
-      <div>
-        <h2 id="chatTitle" class="font-semibold">新会话</h2>
-        <p id="chatSubtitle" class="text-xs text-gray-500">thread_id: -</p>
+    <header class="bg-white dark:bg-gray-800 border-b dark:border-gray-700 px-6 py-4 flex items-center justify-between">
+      <div class="min-w-0">
+        <h2 id="chatTitle" class="font-semibold truncate">新会话</h2>
+        <p id="chatSubtitle" class="text-xs text-gray-500 dark:text-gray-400 truncate">thread_id: -</p>
       </div>
+      <button onclick="toggleDark()" title="切换深色模式"
+        class="ml-4 p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition text-lg">
+        <span id="themeIcon">🌙</span>
+      </button>
     </header>
 
     <div id="messages" class="flex-1 overflow-y-auto px-6 py-4 space-y-4"></div>
 
-    <div class="bg-white border-t p-4">
+    <div class="bg-white dark:bg-gray-800 border-t dark:border-gray-700 p-4">
       <div class="max-w-4xl mx-auto flex gap-2 items-end">
         <textarea id="input" rows="1"
-          class="flex-1 resize-none border border-gray-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 max-h-40"
+          class="flex-1 resize-none border border-gray-300 dark:border-gray-600 dark:bg-gray-900 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 max-h-40"
           placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
         <button onclick="sendMessage()" id="sendBtn"
           class="bg-blue-600 hover:bg-blue-500 text-white px-5 py-2 rounded-lg transition disabled:opacity-50 disabled:cursor-not-allowed">
@@ -64,13 +105,20 @@
 </div>
 
 <script>
+/* ============ 常量与状态 ============ */
 const STORAGE_KEY = 'langgraph_agent_threads';
+const THEME_KEY = 'langgraph_agent_theme';
+
 let threads = loadThreads();
 let currentThreadId = null;
 let isSending = false;
+let currentAbort = null;
 
+/* ============ 初始化 ============ */
 document.addEventListener('DOMContentLoaded', () => {
+  initTheme();
   renderThreads();
+
   const input = document.getElementById('input');
   input.addEventListener('keydown', e => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
@@ -84,6 +132,26 @@ document.addEventListener('DOMContentLoaded', () => {
   else selectThread(threads[0].id);
 });
 
+/* ============ 深色模式 ============ */
+function initTheme() {
+  const saved = localStorage.getItem(THEME_KEY);
+  const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  const dark = saved ? saved === 'dark' : prefersDark;
+  applyTheme(dark);
+}
+
+function toggleDark() {
+  const isDark = document.documentElement.classList.contains('dark');
+  applyTheme(!isDark);
+}
+
+function applyTheme(dark) {
+  document.documentElement.classList.toggle('dark', dark);
+  document.getElementById('themeIcon').textContent = dark ? '☀️' : '🌙';
+  localStorage.setItem(THEME_KEY, dark ? 'dark' : 'light');
+}
+
+/* ============ 会话存储 ============ */
 function loadThreads() {
   try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'); }
   catch { return []; }
@@ -105,10 +173,21 @@ function selectThread(id) {
   loadHistory(id);
 }
 
-function deleteThread(id, ev) {
+async function deleteThread(id, ev) {
   ev.stopPropagation();
+  if (!confirm('确定删除这个会话吗？服务端的历史也会一并清空。')) return;
+
+  // 从本地列表移除
   threads = threads.filter(t => t.id !== id);
   saveThreads();
+
+  // 同步删除服务端数据
+  try {
+    await fetch(`/threads/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  } catch (e) {
+    console.warn('服务端删除失败：', e);
+  }
+
   if (currentThreadId === id) {
     if (threads.length === 0) newThread();
     else selectThread(threads[0].id);
@@ -126,6 +205,7 @@ function renderThreads() {
     </div>`).join('');
 }
 
+/* ============ 消息渲染 ============ */
 function clearMessages() { document.getElementById('messages').innerHTML = ''; }
 
 function showEmpty() {
@@ -150,22 +230,38 @@ function appendMessage(role, content, isLoading = false) {
   div.className = `flex ${isUser ? 'justify-end' : 'justify-start'}`;
   div.innerHTML = `
     <div class="max-w-[75%] px-4 py-2 rounded-2xl shadow-sm whitespace-pre-wrap break-words
-      ${isUser ? 'bg-blue-600 text-white rounded-br-sm' : 'bg-white text-gray-900 rounded-bl-sm border'}">
-      <div class="text-sm leading-relaxed">
-        ${isLoading ? '<span class="typing">思考中</span>' : escapeHtml(content)}
-      </div>
+      ${isUser
+        ? 'bg-blue-600 text-white rounded-br-sm'
+        : 'bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 rounded-bl-sm border dark:border-gray-700'}">
+      <div class="text-sm leading-relaxed markdown-body"></div>
     </div>`;
+  const body = div.querySelector('.markdown-body');
+  if (isLoading) {
+    body.innerHTML = '<span class="typing">思考中</span>';
+  } else if (isUser) {
+    body.textContent = content;             // 用户消息不做 Markdown，原样显示
+  } else {
+    body.innerHTML = renderMarkdown(content);
+  }
   box.appendChild(div);
   box.scrollTop = box.scrollHeight;
   return id;
 }
 
-function updateMessage(id, content) {
+function updateMessage(id, content, markdown = true) {
   const el = document.getElementById(id);
   if (!el) return;
-  el.querySelector('.text-sm').innerHTML = escapeHtml(content);
+  const body = el.querySelector('.markdown-body');
+  body.innerHTML = markdown ? renderMarkdown(content) : escapeHtml(content);
   const box = document.getElementById('messages');
   box.scrollTop = box.scrollHeight;
+}
+
+function renderMarkdown(text) {
+  if (typeof marked === 'undefined') return escapeHtml(text);
+  marked.setOptions({ breaks: true, gfm: true });
+  const raw = marked.parse(text || '');
+  return (typeof DOMPurify !== 'undefined') ? DOMPurify.sanitize(raw) : raw;
 }
 
 function escapeHtml(s) {
@@ -174,6 +270,7 @@ function escapeHtml(s) {
   }[c]));
 }
 
+/* ============ 历史加载 ============ */
 async function loadHistory(threadId) {
   clearMessages();
   try {
@@ -187,6 +284,7 @@ async function loadHistory(threadId) {
   } catch { showEmpty(); setStatus('err', '历史加载失败'); }
 }
 
+/* ============ 发送消息（流式） ============ */
 async function sendMessage() {
   if (isSending) return;
   const input = document.getElementById('input');
@@ -199,23 +297,62 @@ async function sendMessage() {
   input.style.height = 'auto';
 
   appendMessage('user', text);
-  const loadingId = appendMessage('assistant', '', true);
+  const aiMsgId = appendMessage('assistant', '', true);
   setStatus('busy', '生成中...');
 
+  const abort = new AbortController();
+  currentAbort = abort;
+
+  let accumulated = '';
+
   try {
-    const res = await fetch('/chat', {
+    const res = await fetch('/chat/stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json; charset=utf-8' },
-      body: JSON.stringify({ message: text, thread_id: currentThreadId })
+      body: JSON.stringify({ message: text, thread_id: currentThreadId }),
+      signal: abort.signal,
     });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.detail || `HTTP ${res.status}`);
-    }
-    const data = await res.json();
-    updateMessage(loadingId, data.reply);
-    setStatus('ok', '就绪');
 
+    if (!res.ok || !res.body) {
+      const errText = await res.text().catch(() => '');
+      throw new Error(`HTTP ${res.status} ${errText}`.trim());
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      // 按 SSE 事件块拆分（\n\n 分隔）
+      const parts = buffer.split('\n\n');
+      buffer = parts.pop();
+
+      for (const part of parts) {
+        const line = part.split('\n').find(l => l.startsWith('data: '));
+        if (!line) continue;
+        let payload;
+        try { payload = JSON.parse(line.slice(6)); } catch { continue; }
+
+        if (payload.error) {
+          updateMessage(aiMsgId, '❌ ' + payload.error, false);
+          setStatus('err', '请求失败');
+          return;
+        }
+        if (payload.delta) {
+          accumulated += payload.delta;
+          updateMessage(aiMsgId, accumulated);
+        }
+        if (payload.done) {
+          setStatus('ok', '就绪');
+        }
+      }
+    }
+
+    // 首条消息设置会话标题
     const thread = threads.find(t => t.id === currentThreadId);
     if (thread && thread.title === '新会话') {
       thread.title = text.slice(0, 20) + (text.length > 20 ? '...' : '');
@@ -223,15 +360,18 @@ async function sendMessage() {
       document.getElementById('chatTitle').textContent = thread.title;
     }
   } catch (e) {
-    updateMessage(loadingId, '❌ 请求失败: ' + e.message);
+    if (e.name === 'AbortError') return;
+    updateMessage(aiMsgId, '❌ 请求失败: ' + e.message, false);
     setStatus('err', '请求失败');
   } finally {
     isSending = false;
+    currentAbort = null;
     document.getElementById('sendBtn').disabled = false;
     input.focus();
   }
 }
 
+/* ============ 状态指示 ============ */
 function setStatus(type, text) {
   document.getElementById('statusText').textContent = text;
   document.getElementById('statusDot').className = 'w-2 h-2 rounded-full ' + {

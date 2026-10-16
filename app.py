@@ -1,9 +1,10 @@
 import os
+import json
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles                 # ← 新增
+from fastapi.responses import JSONResponse, StreamingResponse          # ← 加 StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -11,7 +12,6 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from agent import build_graph
 
 
-# ---------- 强制 UTF-8 响应 ----------
 class UTF8JSONResponse(JSONResponse):
     media_type = "application/json; charset=utf-8"
 
@@ -50,6 +50,7 @@ class ChatResponse(BaseModel):
     message_count: int
 
 
+# ---------- 原接口：一次性返回 ----------
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
     if graph is None:
@@ -70,6 +71,40 @@ async def chat(req: ChatRequest):
     )
 
 
+# ---------- 新增：SSE 流式输出 ----------
+@app.post("/chat/stream")
+async def chat_stream(req: ChatRequest):
+    if graph is None:
+        raise HTTPException(status_code=500, detail="Agent graph not initialized")
+
+    async def event_generator():
+        try:
+            async for chunk, _meta in graph.astream(
+                {"messages": [HumanMessage(content=req.message)]},
+                config={"configurable": {"thread_id": req.thread_id}},
+                stream_mode="messages",
+            ):
+                content = getattr(chunk, "content", "") or ""
+                if content:
+                    payload = json.dumps({"delta": content}, ensure_ascii=False)
+                    yield f"data: {payload}\n\n"
+            yield f"data: {json.dumps({'done': True})}\n\n"
+        except Exception as e:
+            payload = json.dumps({"error": str(e)}, ensure_ascii=False)
+            yield f"data: {payload}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream; charset=utf-8",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",          # 防止中间层缓冲（Render 上很关键）
+        },
+    )
+
+
+# ---------- 原接口：历史 ----------
 @app.get("/history/{thread_id}")
 async def history(thread_id: str):
     if graph is None:
@@ -89,10 +124,27 @@ async def history(thread_id: str):
     }
 
 
+# ---------- 新增：删除会话 ----------
+@app.delete("/threads/{thread_id}")
+async def delete_thread(thread_id: str):
+    if checkpointer is None:
+        raise HTTPException(status_code=500, detail="Checkpointer not initialized")
+    try:
+        await checkpointer.adelete_thread(thread_id)
+    except AttributeError:
+        raise HTTPException(
+            status_code=501,
+            detail="当前 langgraph-checkpoint-sqlite 版本不支持 adelete_thread",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"deleted": thread_id}
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
 
-# ---------- 静态文件挂载（必须放最后） ----------
+# ---------- 静态资源（必须最后挂载） ----------
 app.mount("/", StaticFiles(directory="static", html=True), name="static")
