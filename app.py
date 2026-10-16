@@ -2,15 +2,18 @@ import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse          # ← 新增
 from pydantic import BaseModel
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from agent import build_graph
 
-# ---------- 数据库路径 ----------
-# 注意：Render 免费层没有持久化磁盘，容器重启后该文件会丢失，短期记忆会重置。
-# 如果需要持久化，可以升级 Render 磁盘，或把状态存到外部数据库（如 Neon Postgres）。
+# ---------- 新增：强制 UTF-8 的 JSON 响应类 ----------
+class UTF8JSONResponse(JSONResponse):
+    media_type = "application/json; charset=utf-8"
+
+
 DB_PATH = "./checkpoints.db"
 
 checkpointer = None
@@ -19,18 +22,20 @@ graph = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global checkpointer, graph
-    
-    # 使用 async with 管理 AsyncSqliteSaver 的生命周期
     async with AsyncSqliteSaver.from_conn_string(DB_PATH) as saver:
         await saver.setup()
         checkpointer = saver
         graph = build_graph(checkpointer)
         yield
-    # 退出时连接会自动关闭
 
-app = FastAPI(title="LangGraph Agent API", lifespan=lifespan)
+# ---------- 修改：指定 default_response_class ----------
+app = FastAPI(
+    title="LangGraph Agent API",
+    lifespan=lifespan,
+    default_response_class=UTF8JSONResponse,       # ← 关键一行
+)
 
-# ---------- 请求/响应模型 ----------
+
 class ChatRequest(BaseModel):
     message: str
     thread_id: str
@@ -40,7 +45,7 @@ class ChatResponse(BaseModel):
     reply: str
     message_count: int
 
-# ---------- 路由 ----------
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
     if graph is None:
@@ -60,6 +65,7 @@ async def chat(req: ChatRequest):
         message_count=len(result["messages"]),
     )
 
+
 @app.get("/history/{thread_id}")
 async def history(thread_id: str):
     if graph is None:
@@ -77,6 +83,7 @@ async def history(thread_id: str):
             for m in state.values["messages"]
         ],
     }
+
 
 @app.get("/health")
 async def health():
