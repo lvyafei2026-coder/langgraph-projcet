@@ -232,7 +232,7 @@ def build_codeact_graph(checkpointer):
     return create_codeact(
         model=llm,
         tools=tools_list,
-        sandbox_executor=secure_sandbox_eval,
+        eval_fn=secure_sandbox_eval,
         checkpointer=checkpointer
     )
 
