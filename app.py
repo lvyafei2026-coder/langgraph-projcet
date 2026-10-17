@@ -1,5 +1,23 @@
-# 导入处修改
+import os
+import json
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from langchain_core.messages import HumanMessage
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+# 导入所有的图构建函数
 from agent import build_chat_graph, build_react_graph, build_plan_act_graph, build_rewoo_graph
+
+class UTF8JSONResponse(JSONResponse):
+    media_type = "application/json; charset=utf-8"
+
+DB_PATH = "./checkpoints.db"
+checkpointer = None
+graphs = {}
 
 # 在 lifespan 中注册
 @asynccontextmanager
