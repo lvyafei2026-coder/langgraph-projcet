@@ -303,7 +303,7 @@ print(算温差(w1, w2))
 
 def _sandbox_execute_recode(code: str) -> str:
     def safe_import(name, *args, **kwargs):
-        raise ImportError(f"当前沙箱不允许使用 import {name}。")
+        raise ImportError(f"当前沙箱不允许使用 import {name}。请使用预置工具。")
 
     safe_builtins = {
         'print': print, 'len': len, 'range': range, 'str': str, 'int': int,
@@ -312,11 +312,16 @@ def _sandbox_execute_recode(code: str) -> str:
         'min': min, 'max': max, 'round': round,
         '__import__': safe_import
     }
-    _locals = {t.name: t.func for t in tools_list}
     
+    # 构建全局执行环境：包含安全的内置函数和工具
+    global_env = {"__builtins__": safe_builtins}
+    for t in tools_list:
+        global_env[t.name] = t.func
+
     try:
         with contextlib.redirect_stdout(io.StringIO()) as f:
-            exec(code, {"__builtins__": safe_builtins}, _locals)
+            # 直接传入 global_env，这样函数内部、外部都能访问到工具
+            exec(code, global_env)
         output = f.getvalue().strip()
         return "__SUCCESS__" + (output if output else "（无输出）")
     except NotImplementedError as e:
@@ -331,35 +336,24 @@ def _extract_func_name_from_traceback() -> str:
 
 def _replace_function(full_code: str, func_name: str, new_func_code: str) -> str:
     """
-    替换指定函数名的完整定义块。
-    通过按行扫描，确保缩进和嵌套函数不会被误伤。
+    使用正则精准替换整个函数块。
+    匹配从 `def 函数名(` 开始，一直到下一个 `def ` 或文件末尾的全部内容。
     """
-    lines = full_code.split('\n')
-    new_lines = []
-    i = 0
-    n = len(lines)
+    # 清理模型可能生成的 markdown 标记和两端空白
+    new_func_code = new_func_code.strip()
+    if new_func_code.startswith("```python"):
+        new_func_code = new_func_code[9:]
+    if new_func_code.endswith("```"):
+        new_func_code = new_func_code[:-3]
+    new_func_code = new_func_code.strip() + "\n"
+
+    # (?m) 多行模式匹配行首, (?s) 让 . 匹配换行符
+    # 匹配: ^def func_name(...): 直到下一个行首的 def 或文件结尾 (\Z)
+    pattern = rf"(?m)^def\s+{re.escape(func_name)}\s*\(.*?\):(?:.|\n)*?(?=^def\s+|\Z)"
     
-    # 匹配 def func_name( 或 def func_name :
-    pattern = re.compile(rf'^\s*def\s+{re.escape(func_name)}\s*\(')
-    
-    while i < n:
-        line = lines[i]
-        if pattern.match(line):
-            # 找到目标函数，开始替换
-            new_lines.append(new_func_code)
-            # 跳过原函数的所有行（直到遇到同级或更高级的 def，或者文件结束）
-            i += 1
-            while i < n:
-                next_line = lines[i]
-                # 如果遇到新的 def，且缩进不大于当前函数，则停止跳过
-                if re.match(r'^\s*def\s+\w+', next_line):
-                    break
-                i += 1
-        else:
-            new_lines.append(line)
-            i += 1
-            
-    return '\n'.join(new_lines)
+    # 将原代码中的占位符函数替换为新生成的代码
+    result = re.sub(pattern, new_func_code, full_code, flags=re.DOTALL)
+    return result
 
 async def recode_executor_node(state: ReCodeState):
     llm = get_llm()
