@@ -6,3 +6,5 @@ langgraph-checkpoint-sqlite==2.0.5
 aiosqlite==0.20.0
 langchain-openai>=0.3.0
 langchain-community==0.3.14
+langgraph-codeact==0.1.0
+RestrictedPython==7.4

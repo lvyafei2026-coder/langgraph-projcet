@@ -62,7 +62,7 @@
     color: #6b7280;
     white-space: pre-wrap;
     word-break: break-word;
-    /* 新增：限制最大高度并允许内部滚动 */
+    /* 修复气泡过高：限制高度并内部滚动 */
     max-height: 250px;
     overflow-y: auto;
   }
@@ -90,7 +90,7 @@
   <aside class="w-64 bg-gray-900 text-gray-100 flex flex-col shrink-0 dark:bg-black">
     <div class="p-4 border-b border-gray-800">
       <h1 class="text-lg font-semibold">🤖 LangGraph</h1>
-      <p class="text-xs text-gray-500 mt-1">DeepSeek Reasoner · 短期记忆</p>
+      <p class="text-xs text-gray-500 mt-1">DeepSeek · 多模式 Agent</p>
     </div>
     <div class="p-3">
       <button onclick="newThread()" class="w-full bg-blue-600 hover:bg-blue-500 text-white text-sm py-2 rounded-lg transition">
@@ -113,13 +113,15 @@
         <p id="chatSubtitle" class="text-xs text-gray-500 dark:text-gray-400 truncate">thread_id: -</p>
       </div>
       
-      <!-- 新增：模式选择 -->
+      <!-- 模式选择 -->
       <div class="flex items-center gap-3 ml-4">
         <select id="modeSelect" class="text-sm border rounded-lg px-2 py-1.5 bg-gray-50 dark:bg-gray-900 dark:border-gray-600 focus:outline-none">
-          <option value="chat">💬 普通对话 (原生思考)</option>
+          <option value="chat">💬 普通对话</option>
           <option value="react">🔄 ReAct (边想边做)</option>
           <option value="plan_act">📝 Plan-Act (分步执行)</option>
-          <option value="rewoo">🧠 ReWOO (先统排后执行)</option> <!-- 新增 -->
+          <option value="rewoo">🧠 ReWOO (先统排后执行)</option>
+          <option value="codeact">💻 CodeAct (代码执行)</option>
+          <option value="recode">🌳 ReCode (递归代码)</option>
         </select>
         
         <button onclick="toggleDark()" title="切换深色模式"
@@ -247,10 +249,6 @@ function showEmpty() {
     </div>`;
 }
 
-/**
- * 创建一条消息 DOM。
- * 对于 assistant 消息，会同时创建「思考过程」折叠面板和「回答」区域。
- */
 function appendMessage(role, content, reasoning = '', isLoading = false) {
   const box = document.getElementById('messages');
   const empty = box.querySelector('.h-full');
@@ -263,25 +261,21 @@ function appendMessage(role, content, reasoning = '', isLoading = false) {
   div.className = `flex ${isUser ? 'justify-end' : 'justify-start'}`;
 
   if (isUser) {
-    // 用户消息：简单渲染
     div.innerHTML = `
       <div class="max-w-[75%] px-4 py-2 rounded-2xl shadow-sm whitespace-pre-wrap break-words
         bg-blue-600 text-white rounded-br-sm">
         <div class="text-sm leading-relaxed">${escapeHtml(content)}</div>
       </div>`;
   } else {
-    // AI 消息：包含思考过程 + 回答
     div.innerHTML = `
       <div class="max-w-[75%] w-full">
-        <!-- 思考过程面板 -->
         <details class="reasoning-panel mb-2" id="${id}-reasoning-panel" ${reasoning ? '' : 'style="display:none"'}>
           <summary class="px-3 py-1.5 text-xs text-purple-600 dark:text-purple-400 font-medium flex items-center">
-            <span>💭 思考过程</span>
+            <span>💭 思考过程 / 执行轨迹</span>
             <span class="ml-auto text-gray-400 text-[10px]" id="${id}-reasoning-status"></span>
           </summary>
           <div class="px-3 pb-2 reasoning-content" id="${id}-reasoning"></div>
         </details>
-        <!-- 最终回答 -->
         <div class="bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 rounded-2xl rounded-bl-sm border dark:border-gray-700 shadow-sm px-4 py-2">
           <div class="text-sm leading-relaxed markdown-body" id="${id}-content"></div>
         </div>
@@ -293,13 +287,12 @@ function appendMessage(role, content, reasoning = '', isLoading = false) {
     contentEl.innerHTML = '<span class="typing">思考中</span>';
   } else if (!isUser) {
     contentEl.innerHTML = renderMarkdown(content);
-    // 如果有历史思考内容，直接填充
     if (reasoning) {
       const rPanel = div.querySelector(`#${id}-reasoning-panel`);
       const rContent = div.querySelector(`#${id}-reasoning`);
       if (rPanel) rPanel.style.display = '';
       if (rContent) rContent.textContent = reasoning;
-      if (rPanel) rPanel.open = true; // 历史记录默认展开
+      if (rPanel) rPanel.open = true;
     }
   }
 
@@ -308,32 +301,28 @@ function appendMessage(role, content, reasoning = '', isLoading = false) {
   return id;
 }
 
-/** 追加思考过程的增量内容 */
 function appendReasoning(msgId, delta) {
   const panel = document.getElementById(`${msgId}-reasoning-panel`);
   const content = document.getElementById(`${msgId}-reasoning`);
   const status = document.getElementById(`${msgId}-reasoning-status`);
   if (!panel || !content) return;
 
-  // 显示面板
   panel.style.display = '';
   panel.open = true;
-  if (status) status.textContent = '思考中...';
+  if (status) status.textContent = '执行中...';
 
   content.textContent += delta;
   const box = document.getElementById('messages');
   box.scrollTop = box.scrollHeight;
 }
 
-/** 思考结束，更新状态文字 */
 function finishReasoning(msgId) {
   const status = document.getElementById(`${msgId}-reasoning-status`);
   if (status) status.textContent = '已完成';
   const panel = document.getElementById(`${msgId}-reasoning-panel`);
-  if (panel) panel.open = false; // 思考完成后自动折叠
+  if (panel) panel.open = false;
 }
 
-/** 更新最终回答 */
 function updateContent(msgId, content) {
   const el = document.getElementById(`${msgId}-content`);
   if (!el) return;
@@ -355,7 +344,7 @@ function escapeHtml(s) {
   }[c]));
 }
 
-/* ============ 历史加载（含 reasoning_content） ============ */
+/* ============ 历史加载 ============ */
 async function loadHistory(threadId) {
   clearMessages();
   try {
@@ -369,7 +358,7 @@ async function loadHistory(threadId) {
   } catch { showEmpty(); setStatus('err', '历史加载失败'); }
 }
 
-/* ============ 发送消息（流式 + 思考过程分离） ============ */
+/* ============ 发送消息 ============ */
 async function sendMessage() {
   if (isSending) return;
   const input = document.getElementById('input');
@@ -398,7 +387,7 @@ async function sendMessage() {
       body: JSON.stringify({ 
         message: text, 
         thread_id: currentThreadId,
-        mode: document.getElementById('modeSelect').value // <-- 获取当前模式
+        mode: document.getElementById('modeSelect').value
       }),
       signal: abort.signal,
     });
@@ -432,19 +421,16 @@ async function sendMessage() {
           return;
         }
 
-        // 处理思考过程
         if (payload.type === 'reasoning' && payload.delta) {
           if (!reasoningStarted) {
             reasoningStarted = true;
-            setStatus('busy', '思考中...');
+            setStatus('busy', '执行中...');
           }
           appendReasoning(aiMsgId, payload.delta);
         }
 
-        // 处理最终回答
         if (payload.type === 'content' && payload.delta) {
           if (reasoningStarted && accumulatedContent === '') {
-            // 第一次收到 content，说明思考阶段结束
             finishReasoning(aiMsgId);
             setStatus('busy', '回答中...');
           }
@@ -459,7 +445,6 @@ async function sendMessage() {
       }
     }
 
-    // 首条消息设置会话标题
     const thread = threads.find(t => t.id === currentThreadId);
     if (thread && thread.title === '新会话') {
       thread.title = text.slice(0, 20) + (text.length > 20 ? '...' : '');

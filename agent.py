@@ -1,38 +1,41 @@
 import os
 import json
-import operator
-from typing import Annotated, TypedDict, Union
+import re
+import traceback
+import contextlib
+import io
+from typing import Annotated, TypedDict, Any
 
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 from langchain_core.tools import tool
 from langgraph.graph import StateGraph, START, END, MessagesState
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph_codeact import create_codeact
+from RestrictedPython import compile_restricted_exec
 
-# ================= 1. 定义工具 =================
+# ================= 1. 基础定义与工具 =================
+@tool
+def get_weather(city: str) -> str:
+    """获取指定城市的天气。"""
+    return f"{city}今天晴转多云，气温 22-28 度。"
+
 @tool
 def calculate(expression: str) -> str:
-    """计算数学表达式。例如: '9.11 - 9.8', '2 * 3 + 4'"""
+    """计算数学表达式。例如: '9.11 - 9.8'"""
     try:
-        # 仅做演示，实际生产环境请勿直接用 eval
         result = eval(expression, {"__builtins__": None}, {})
         return f"计算结果: {expression} = {result}"
     except Exception as e:
         return f"计算失败: {str(e)}"
 
-@tool
-def get_weather(city: str) -> str:
-    """获取指定城市的天气。"""
-    # 模拟天气 API
-    return f"{city}今天晴转多云，气温 22-28 度，适合出行。"
-
-tools_list = [calculate, get_weather]
+tools_list = [get_weather, calculate]
 
 # ================= 2. LLM 初始化 =================
 def get_llm(with_tools=False):
     llm = ChatOpenAI(
-        model=os.getenv("MODEL_NAME", "deepseek-reasoner"), # 建议默认用 reasoner
+        model=os.getenv("MODEL_NAME", "deepseek-chat"),
         api_key=os.getenv("DEEPSEEK_API_KEY"),
         base_url="https://api.deepseek.com/v1",
         temperature=0.7,
@@ -41,7 +44,7 @@ def get_llm(with_tools=False):
         return llm.bind_tools(tools_list)
     return llm
 
-# ================= 3. 构建 Chat 图 =================
+# ================= 3. 普通 Chat 图 =================
 class ChatState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
 
@@ -57,8 +60,7 @@ def build_chat_graph(checkpointer):
     workflow.add_edge("agent", END)
     return workflow.compile(checkpointer=checkpointer)
 
-# ================= 4. 构建 ReAct 图 =================
-# ReAct: 思考 -> 调用工具 -> 观察结果 -> 再次思考，直到输出最终答案
+# ================= 4. ReAct 图 =================
 async def react_agent_node(state: MessagesState):
     llm = get_llm(with_tools=True)
     response = await llm.ainvoke(state["messages"])
@@ -68,16 +70,12 @@ def build_react_graph(checkpointer):
     workflow = StateGraph(MessagesState)
     workflow.add_node("agent", react_agent_node)
     workflow.add_node("tools", ToolNode(tools_list))
-    
     workflow.add_edge(START, "agent")
-    # 如果模型决定调用工具，走向 tools 节点；否则结束
     workflow.add_conditional_edges("agent", tools_condition)
     workflow.add_edge("tools", "agent")
-    
     return workflow.compile(checkpointer=checkpointer)
 
-# ================= 5. 构建 Plan-Act 图 =================
-# Plan-Act: 先生成计划 (Plan)，再逐步执行 (Act)
+# ================= 5. Plan-Act 图 =================
 class PlanActState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
     plan: list[str]
@@ -87,12 +85,8 @@ async def planner_node(state: PlanActState):
     llm = get_llm()
     prompt = f"""你是任务规划专家。请将用户的请求拆解为 1-3 个步骤。
 用户请求: {state['messages'][-1].content}
-
-请直接输出 JSON 格式的步骤列表，不要输出任何其他内容。
-例如: ["步骤1内容", "步骤2内容"]
-"""
+直接输出 JSON 格式的步骤列表，不要输出任何其他内容。例如: ["步骤1", "步骤2"]"""
     res = await llm.ainvoke([HumanMessage(content=prompt)])
-    # 简单解析 JSON
     try:
         text = res.content.strip()
         if text.startswith("```json"): text = text[7:-3]
@@ -100,39 +94,29 @@ async def planner_node(state: PlanActState):
     except:
         plan = [f"直接回答问题: {state['messages'][-1].content}"]
     
-    # 将规划过程包装成 reasoning_content 供前端显示
     reasoning_msg = AIMessage(
         content="",
-        additional_kwargs={"reasoning_content": f"【规划阶段】\n制定计划:\n{json.dumps(plan, ensure_ascii=False, indent=2)}\n\n"}
+        additional_kwargs={"reasoning_content": f"【📝 Plan-Act 规划阶段】\n{json.dumps(plan, ensure_ascii=False, indent=2)}\n\n"}
     )
     return {"plan": plan, "current_step": 0, "messages": [reasoning_msg]}
 
 async def executor_node(state: PlanActState):
     llm = get_llm()
     step = state["plan"][state["current_step"]]
-    # 将之前的执行结果作为上下文
     context = "\n".join([f"- {m.content}" for m in state["messages"] if m.content])
-    
-    prompt = f"""你正在执行任务计划。
-当前步骤: {step}
-已知信息: {context}
-请执行该步骤并给出结果。"""
-    
+    prompt = f"你正在执行任务计划。\n当前步骤: {step}\n已知信息: {context}\n请执行并给出结果。"
     res = await llm.ainvoke([HumanMessage(content=prompt)])
     
     reasoning_msg = AIMessage(
         content="",
-        additional_kwargs={"reasoning_content": f"【执行阶段 步骤{state['current_step']+1}】\n执行: {step}\n结果: {res.content}\n\n"}
+        additional_kwargs={"reasoning_content": f"【⚙️ Plan-Act 执行阶段 {state['current_step']+1}】\n执行: {step}\n结果: {res.content}\n\n"}
     )
     return {"current_step": state["current_step"] + 1, "messages": [reasoning_msg]}
 
 async def finalizer_node(state: PlanActState):
     llm = get_llm()
     context = "\n".join([m.additional_kwargs.get("reasoning_content", "") for m in state["messages"] if hasattr(m, "additional_kwargs")])
-    prompt = f"""根据以下计划执行过程，给用户一个完整、清晰的最终回复。
-执行过程:
-{context}
-"""
+    prompt = f"根据以下执行过程，给用户一个完整清晰的最终回复。\n执行过程:\n{context}"
     res = await llm.ainvoke([HumanMessage(content=prompt)])
     return {"messages": [res]}
 
@@ -146,77 +130,51 @@ def build_plan_act_graph(checkpointer):
     workflow.add_node("planner", planner_node)
     workflow.add_node("executor", executor_node)
     workflow.add_node("finalizer", finalizer_node)
-    
     workflow.add_edge(START, "planner")
     workflow.add_conditional_edges("planner", should_continue_plan)
     workflow.add_conditional_edges("executor", should_continue_plan)
     workflow.add_edge("finalizer", END)
-    
     return workflow.compile(checkpointer=checkpointer)
 
-# ================= 6. 构建 ReWOO 图 =================
-# ReWOO: 规划器生成所有工具调用计划 -> 执行器依次执行 -> 解决器汇总生成回答
-
+# ================= 6. ReWOO 图 =================
 class ReWOOState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
-    plan: list[dict]     # 规划步骤，例如 [{"tool": "get_weather", "args": {"city": "北京"}}]
-    evidences: str       # 工具执行结果集合
+    plan: list[dict]
+    evidences: str
 
 async def rewoo_planner_node(state: ReWOOState):
     llm = get_llm()
-    prompt = f"""你是任务规划专家。请根据用户的问题，制定一个最多包含3个步骤的执行计划。
-可用工具：
-- calculate(expression: str) # 数学计算
-- get_weather(city: str)     # 查天气
-
-请直接输出严格的 JSON 格式，不要输出其他内容。格式如下：
-{{
-  "plan": [
-    {{"tool": "get_weather", "args": {{"city": "北京"}}}},
-    {{"tool": "calculate", "args": {{"expression": "22 + 5"}}}}
-  ]
-}}
-如果不需要使用工具，请返回: {{"plan": []}}
-
-用户问题: {state['messages'][-1].content}
-"""
+    prompt = f"""你是任务规划专家。制定最多3个步骤的工具执行计划。
+可用工具：calculate(expression: str), get_weather(city: str)
+直接输出严格 JSON 格式: {{"plan": [{{"tool": "get_weather", "args": {{"city": "北京"}}}}]}}
+如果不需要工具: {{"plan": []}}
+用户问题: {state['messages'][-1].content}"""
     res = await llm.ainvoke([HumanMessage(content=prompt)])
-    
-    # 解析 JSON
     try:
         text = res.content.strip()
         if text.startswith("```json"): text = text[7:-3]
         if text.startswith("```"): text = text[3:-3]
-        data = json.loads(text)
-        plan = data.get("plan", [])
+        plan = json.loads(text).get("plan", [])
     except:
         plan = []
-    
     reasoning_msg = AIMessage(
         content="",
-        additional_kwargs={"reasoning_content": f"【🧠 ReWOO 规划阶段】\n生成的计划:\n{json.dumps(plan, ensure_ascii=False, indent=2)}\n\n"}
+        additional_kwargs={"reasoning_content": f"【🧠 ReWOO 规划阶段】\n{json.dumps(plan, ensure_ascii=False, indent=2)}\n\n"}
     )
     return {"plan": plan, "messages": [reasoning_msg]}
 
 async def rewoo_worker_node(state: ReWOOState):
-    # 依次执行计划中的工具
     evidences = []
     for i, step in enumerate(state["plan"]):
         tool_name = step.get("tool")
         args = step.get("args", {})
-        
-        # 找到对应的工具
         target_tool = next((t for t in tools_list if t.name == tool_name), None)
         if target_tool:
-            try:
-                result = target_tool.invoke(args)
-            except Exception as e:
-                result = f"执行失败: {str(e)}"
+            try: result = target_tool.invoke(args)
+            except Exception as e: result = f"失败: {e}"
         else:
             result = f"未找到工具 {tool_name}"
-            
-        evidences.append(f"#E{i+1}: 调用 {tool_name}({json.dumps(args, ensure_ascii=False)}) 返回 -> {result}")
-
+        evidences.append(f"#E{i+1}: 调用 {tool_name} 返回 -> {result}")
     evidence_str = "\n".join(evidences) if evidences else "无工具调用。"
     
     reasoning_msg = AIMessage(
@@ -227,13 +185,7 @@ async def rewoo_worker_node(state: ReWOOState):
 
 async def rewoo_solver_node(state: ReWOOState):
     llm = get_llm()
-    prompt = f"""你是一个聪明的助手。请根据已知的工具执行结果，回答用户的问题。
-
-已知信息:
-{state.get('evidences', '无')}
-
-用户问题: {state['messages'][0].content}
-"""
+    prompt = f"根据已知信息回答用户问题。\n已知信息:\n{state.get('evidences', '无')}\n用户问题: {state['messages'][0].content}"
     res = await llm.ainvoke([HumanMessage(content=prompt)])
     return {"messages": [res]}
 
@@ -242,10 +194,172 @@ def build_rewoo_graph(checkpointer):
     workflow.add_node("planner", rewoo_planner_node)
     workflow.add_node("worker", rewoo_worker_node)
     workflow.add_node("solver", rewoo_solver_node)
-    
     workflow.add_edge(START, "planner")
     workflow.add_edge("planner", "worker")
     workflow.add_edge("worker", "solver")
     workflow.add_edge("solver", END)
+    return workflow.compile(checkpointer=checkpointer)
+
+# ================= 7. CodeAct 图 =================
+def secure_sandbox_eval(code: str, _locals: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    original_keys = set(_locals.keys())
+    for t in tools_list:
+        _locals[t.name] = t.func
+
+    safe_builtins = {
+        'print': print, 'len': len, 'range': range, 'str': str, 'int': int,
+        'float': float, 'list': list, 'dict': dict, 'set': set, 'tuple': tuple,
+        'Exception': Exception, 'ValueError': ValueError, 'TypeError': TypeError,
+        '__import__': __import__,
+    }
     
+    try:
+        byte_code = compile_restricted_exec(code)
+        if byte_code.errors: return f"代码编译错误: {byte_code.errors}", _locals
+        
+        with contextlib.redirect_stdout(io.StringIO()) as f:
+            exec(byte_code.code, {"__builtins__": safe_builtins}, _locals)
+        result = f.getvalue() or "<代码执行成功，无输出>"
+    except Exception as e:
+        result = f"执行错误: {repr(e)}"
+    
+    new_keys = set(_locals.keys()) - original_keys
+    new_vars = {k: _locals[k] for k in new_keys if not k.startswith('__') and k not in [t.name for t in tools_list]}
+    return result, new_vars
+
+def build_codeact_graph(checkpointer):
+    llm = get_llm()
+    return create_codeact(
+        model=llm,
+        tools=tools_list,
+        sandbox_executor=secure_sandbox_eval,
+        checkpointer=checkpointer
+    )
+
+# ================= 8. ReCode 图 (递归代码生成) =================
+class ReCodeState(TypedDict):
+    messages: Annotated[list[BaseMessage], add_messages]
+    code: str
+    execution_trace: str
+
+async def recode_planner_node(state: ReCodeState):
+    llm = get_llm()
+    user_query = state['messages'][-1].content if state['messages'] else ""
+    prompt = f"""你是代码规划专家。请为用户需求生成一个 Python 代码骨架。
+要求：
+1. 将高层计划写成抽象函数，函数体为 `raise NotImplementedError("待分解")`。
+2. 在最后调用这些函数。
+3. 只输出 Python 代码，不要用 markdown 包裹。
+
+用户需求: {user_query}
+
+示例输出：
+def 查天气(city):
+    raise NotImplementedError("待分解")
+
+w1 = 查天气("北京")
+print(w1)
+"""
+    res = await llm.ainvoke([HumanMessage(content=prompt)])
+    code = res.content.strip()
+    if code.startswith("```python"): code = code[9:-3]
+    elif code.startswith("```"): code = code[3:-3]
+    
+    # 去掉内部可能引起冲突的 Markdown 反引号
+    reasoning_msg = AIMessage(
+        content="",
+        additional_kwargs={"reasoning_content": f"【📝 ReCode 规划阶段】\n{code}\n\n"}
+    )
+    return {"code": code, "execution_trace": "", "messages": [reasoning_msg]}
+
+def _sandbox_execute_recode(code: str) -> str:
+    safe_builtins = {
+        'print': print, 'len': len, 'range': range, 'str': str, 'int': int,
+        'float': float, 'list': list, 'dict': dict, 'Exception': Exception,
+        'NotImplementedError': NotImplementedError, 'abs': abs, 'sum': sum
+    }
+    _locals = {t.name: t.func for t in tools_list}
+    
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as f:
+            exec(code, {"__builtins__": safe_builtins}, _locals)
+        output = f.getvalue().strip()
+        return "__SUCCESS__" + (output if output else "（无输出）")
+    except NotImplementedError as e:
+        raise e
+    except Exception as e:
+        return f"__ERROR__执行错误: {repr(e)}"
+
+def _extract_func_name_from_traceback() -> str:
+    tb = traceback.format_exc()
+    matches = re.findall(r'in (\w+)', tb)
+    return matches[-1] if matches else "未知函数"
+
+def _replace_function(full_code: str, func_name: str, new_func_code: str) -> str:
+    pattern = rf"(def {func_name}\s*\(.*?\):)(.*?)(?=\ndef |\Z)"
+    return re.sub(pattern, new_func_code, full_code, flags=re.DOTALL)
+
+async def recode_executor_node(state: ReCodeState):
+    llm = get_llm()
+    code = state["code"]
+    trace = state.get("execution_trace", "")
+    max_steps = 5
+    step = 0
+    final_output = ""
+    
+    while step < max_steps:
+        step += 1
+        try:
+            result = _sandbox_execute_recode(code)
+            if result.startswith("__SUCCESS__"):
+                final_output = result.replace("__SUCCESS__", "").strip()
+                trace += f"\n✅ 第 {step} 次执行成功，最终输出:\n{final_output}\n"
+                break
+            else:
+                trace += f"\n⚠️ 第 {step} 次执行代码报错:\n{result}\n"
+                break
+        except NotImplementedError:
+            func_name = _extract_func_name_from_traceback()
+            trace += f"\n🔍 第 {step} 次执行触发占位符: `{func_name}()`，开始递归分解...\n"
+            
+            # 去掉了 markdown 代码块标记，避免字符串转义冲突
+            prompt = f"""你正在递归分解一个 Python 函数。
+当前代码:
+{code}
+
+未实现的函数: `{func_name}`
+
+请为 `{func_name}` 提供具体实现代码，直接输出该函数的完整定义，不要输出其他内容。
+"""
+            decomp_res = await llm.ainvoke([HumanMessage(content=prompt)])
+            new_func_code = decomp_res.content.strip()
+            if new_func_code.startswith("```python"): new_func_code = new_func_code[9:-3]
+            elif new_func_code.startswith("```"): new_func_code = new_func_code[3:-3]
+            
+            code = _replace_function(code, func_name, new_func_code)
+            trace += f"   ↳ 已生成实现:\n{new_func_code}\n"
+        except Exception as e:
+            trace += f"\n❌ 第 {step} 次执行发生未知错误: {repr(e)}\n"
+            break
+            
+    reasoning_msg = AIMessage(
+        content="",
+        additional_kwargs={"reasoning_content": f"【⚙️ ReCode 递归执行阶段】\n{trace}\n\n"}
+    )
+    
+    content_msg = AIMessage(content=final_output if final_output else "执行完成，但无标准输出。请查看思考过程。")
+    
+    return {
+        "code": code, 
+        "execution_trace": trace,
+        "messages": [reasoning_msg, content_msg]
+    }
+
+def build_recode_graph(checkpointer):
+    workflow = StateGraph(ReCodeState)
+    workflow.add_node("planner", recode_planner_node)
+    workflow.add_node("executor", recode_executor_node)
+    workflow.add_edge(START, "planner")
+    workflow.add_edge("planner", "executor")
+    workflow.add_edge("executor", END)
     return workflow.compile(checkpointer=checkpointer)
