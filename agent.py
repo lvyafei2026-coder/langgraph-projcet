@@ -206,11 +206,16 @@ def secure_sandbox_eval(code: str, _locals: dict[str, Any]) -> tuple[str, dict[s
     for t in tools_list:
         _locals[t.name] = t.func
 
+    # 禁止 import，防止模块对象污染 State
+    def safe_import(name, *args, **kwargs):
+        raise ImportError(f"当前沙箱不允许使用 import {name}，请仅使用提供的工具或基础数学运算。")
+
     safe_builtins = {
         'print': print, 'len': len, 'range': range, 'str': str, 'int': int,
         'float': float, 'list': list, 'dict': dict, 'set': set, 'tuple': tuple,
         'Exception': Exception, 'ValueError': ValueError, 'TypeError': TypeError,
-        '__import__': __import__,
+        '__import__': safe_import, # <-- 替换为安全的 import
+        'abs': abs, 'sum': sum, 'min': min, 'max': max, 'round': round
     }
     
     try:
@@ -223,21 +228,30 @@ def secure_sandbox_eval(code: str, _locals: dict[str, Any]) -> tuple[str, dict[s
     except Exception as e:
         result = f"执行错误: {repr(e)}"
     
+    # 过滤出新增的、且可以被 JSON 序列化的基础变量，防止 module / function 对象存入 State
     new_keys = set(_locals.keys()) - original_keys
-    new_vars = {k: _locals[k] for k in new_keys if not k.startswith('__') and k not in [t.name for t in tools_list]}
+    new_vars = {}
+    for k in new_keys:
+        if k.startswith('__') or k in [t.name for t in tools_list]:
+            continue
+        val = _locals[k]
+        # 只保留基本数据类型
+        if isinstance(val, (int, float, str, bool, list, dict, tuple, set, type(None))):
+            try:
+                json.dumps(val) # 二次验证是否可序列化
+                new_vars[k] = val
+            except:
+                pass
+                
     return result, new_vars
 
 def build_codeact_graph(checkpointer):
     llm = get_llm()
-    
-    # 1. 构建 CodeAct 图 (不传 checkpointer)
     codeact_graph = create_codeact(
         model=llm,
         tools=tools_list,
         eval_fn=secure_sandbox_eval,
     )
-    
-    # 2. 在编译时注入 checkpointer
     return codeact_graph.compile(checkpointer=checkpointer)
 
 # ================= 8. ReCode 图 (递归代码生成) =================
@@ -277,10 +291,15 @@ print(w1)
     return {"code": code, "execution_trace": "", "messages": [reasoning_msg]}
 
 def _sandbox_execute_recode(code: str) -> str:
+    def safe_import(name, *args, **kwargs):
+        raise ImportError(f"当前沙箱不允许使用 import {name}。")
+
     safe_builtins = {
         'print': print, 'len': len, 'range': range, 'str': str, 'int': int,
         'float': float, 'list': list, 'dict': dict, 'Exception': Exception,
-        'NotImplementedError': NotImplementedError, 'abs': abs, 'sum': sum
+        'NotImplementedError': NotImplementedError, 'abs': abs, 'sum': sum,
+        'min': min, 'max': max, 'round': round,
+        '__import__': safe_import
     }
     _locals = {t.name: t.func for t in tools_list}
     
