@@ -8,12 +8,20 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+import aiosqlite
 
 # 导入所有的图构建函数
 from agent import (
     build_chat_graph, build_react_graph, build_plan_act_graph, 
     build_rewoo_graph, build_codeact_graph, build_recode_graph
 )
+
+# ---------- 兼容补丁 ----------
+if not hasattr(aiosqlite.Connection, "is_alive"):
+    def _is_alive_patch(self):
+        return True
+    aiosqlite.Connection.is_alive = _is_alive_patch
+# -----------------------------
 
 class UTF8JSONResponse(JSONResponse):
     media_type = "application/json; charset=utf-8"
