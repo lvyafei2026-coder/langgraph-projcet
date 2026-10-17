@@ -229,12 +229,16 @@ def secure_sandbox_eval(code: str, _locals: dict[str, Any]) -> tuple[str, dict[s
 
 def build_codeact_graph(checkpointer):
     llm = get_llm()
-    return create_codeact(
+    
+    # 1. 构建 CodeAct 图 (不传 checkpointer)
+    codeact_graph = create_codeact(
         model=llm,
         tools=tools_list,
         eval_fn=secure_sandbox_eval,
-        checkpointer=checkpointer
     )
+    
+    # 2. 在编译时注入 checkpointer
+    return codeact_graph.compile(checkpointer=checkpointer)
 
 # ================= 8. ReCode 图 (递归代码生成) =================
 class ReCodeState(TypedDict):
