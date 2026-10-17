@@ -334,27 +334,6 @@ def _extract_func_name_from_traceback() -> str:
     matches = re.findall(r'in (\w+)', tb)
     return matches[-1] if matches else "未知函数"
 
-def _replace_function(full_code: str, func_name: str, new_func_code: str) -> str:
-    """
-    使用正则精准替换整个函数块。
-    匹配从 `def 函数名(` 开始，一直到下一个 `def ` 或文件末尾的全部内容。
-    """
-    # 清理模型可能生成的 markdown 标记和两端空白
-    new_func_code = new_func_code.strip()
-    if new_func_code.startswith("```python"):
-        new_func_code = new_func_code[9:]
-    if new_func_code.endswith("```"):
-        new_func_code = new_func_code[:-3]
-    new_func_code = new_func_code.strip() + "\n"
-
-    # (?m) 多行模式匹配行首, (?s) 让 . 匹配换行符
-    # 匹配: ^def func_name(...): 直到下一个行首的 def 或文件结尾 (\Z)
-    pattern = rf"(?m)^def\s+{re.escape(func_name)}\s*\(.*?\):(?:.|\n)*?(?=^def\s+|\Z)"
-    
-    # 将原代码中的占位符函数替换为新生成的代码
-    result = re.sub(pattern, new_func_code, full_code, flags=re.DOTALL)
-    return result
-
 async def recode_executor_node(state: ReCodeState):
     llm = get_llm()
     code = state["code"]
@@ -374,30 +353,62 @@ async def recode_executor_node(state: ReCodeState):
                 trace += f"\n✅ 第 {step} 次执行成功，最终输出:\n{final_output}\n"
                 break
             else:
+                # 如果是 NameError、SyntaxError 等非 NotImplementedError 错误
                 trace += f"\n⚠️ 第 {step} 次执行代码报错:\n{result}\n"
-                break
+                
+                # 让模型根据报错修复完整代码
+                prompt = f"""你正在编写一个 Python 脚本。当前代码执行报错，请修复它。
+可用工具（请直接调用，禁止使用 import）：
+{tool_descriptions}
+
+当前完整代码:
+{code}
+
+执行报错信息:
+{result}
+
+请修复报错。输出【完整的、可以直接运行的 Python 代码】，包含所有的函数实现和主流程。
+注意：
+1. 必须使用提供的工具。
+2. 必须包含所有的代码和正确的缩进。
+3. 不要输出 markdown 包裹，只输出纯 Python 代码。
+"""
+                fix_res = await llm.ainvoke([HumanMessage(content=prompt)])
+                new_code = fix_res.content.strip()
+                if new_code.startswith("```python"): new_code = new_code[9:-3]
+                elif new_code.startswith("```"): new_code = new_code[3:-3]
+                
+                trace += f"   ↳ 已尝试修复代码错误，重新执行...\n"
+                code = new_code
+                continue # 继续下一次循环执行新代码
+
         except NotImplementedError:
             func_name = _extract_func_name_from_traceback()
             trace += f"\n🔍 第 {step} 次执行触发占位符: `{func_name}()`，开始递归分解...\n"
             
-            prompt = f"""你正在递归分解一个 Python 函数。
-可用工具（请直接调用这些工具，禁止使用 import）：
+            # 让模型输出【完整的包含所有函数】的代码，而不是只输出单个函数
+            prompt = f"""你正在递归分解并补全一个 Python 脚本。
+可用工具（请直接调用，禁止使用 import）：
 {tool_descriptions}
 
-当前代码:
+当前完整代码:
 {code}
 
 未实现的函数: `{func_name}`
 
-请为 `{func_name}` 提供具体实现代码，直接输出该函数的完整定义，不要输出其他内容。
+请补全 `{func_name}` 函数的具体实现。
+**极其重要**：请输出【完整的、可以直接运行的 Python 代码】（包含原有的所有占位符、新实现的函数、以及主流程调用代码）。必须确保代码有正确的缩进。
+不要输出其他任何内容。
 """
             decomp_res = await llm.ainvoke([HumanMessage(content=prompt)])
-            new_func_code = decomp_res.content.strip()
-            if new_func_code.startswith("```python"): new_func_code = new_func_code[9:-3]
-            elif new_func_code.startswith("```"): new_func_code = new_func_code[3:-3]
+            new_code = decomp_res.content.strip()
+            if new_code.startswith("```python"): new_code = new_code[9:-3]
+            elif new_code.startswith("```"): new_code = new_code[3:-3]
             
-            code = _replace_function(code, func_name, new_func_code)
-            trace += f"   ↳ 已生成实现:\n{new_func_code}\n"
+            trace += f"   ↳ 已补全函数 `{func_name}`，生成的代码长度: {len(new_code)} 字符\n"
+            code = new_code
+            continue # 继续下一次循环
+
         except Exception as e:
             trace += f"\n❌ 第 {step} 次执行发生未知错误: {repr(e)}\n"
             break
