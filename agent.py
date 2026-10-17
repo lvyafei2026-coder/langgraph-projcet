@@ -263,11 +263,19 @@ class ReCodeState(TypedDict):
 async def recode_planner_node(state: ReCodeState):
     llm = get_llm()
     user_query = state['messages'][-1].content if state['messages'] else ""
+    
+    # 动态获取工具描述
+    tool_descriptions = "\n".join([f"- {t.name}: {t.description}" for t in tools_list])
+
     prompt = f"""你是代码规划专家。请为用户需求生成一个 Python 代码骨架。
+可用工具（请在分解时调用这些工具，不要使用 import 引入其他库）：
+{tool_descriptions}
+
 要求：
 1. 将高层计划写成抽象函数，函数体为 `raise NotImplementedError("待分解")`。
 2. 在最后调用这些函数。
 3. 只输出 Python 代码，不要用 markdown 包裹。
+4. 禁止使用 import 语句。
 
 用户需求: {user_query}
 
@@ -275,15 +283,18 @@ async def recode_planner_node(state: ReCodeState):
 def 查天气(city):
     raise NotImplementedError("待分解")
 
+def 算温差(t1, t2):
+    raise NotImplementedError("待分解")
+
 w1 = 查天气("北京")
-print(w1)
+w2 = 查天气("上海")
+print(算温差(w1, w2))
 """
     res = await llm.ainvoke([HumanMessage(content=prompt)])
     code = res.content.strip()
     if code.startswith("```python"): code = code[9:-3]
     elif code.startswith("```"): code = code[3:-3]
     
-    # 去掉内部可能引起冲突的 Markdown 反引号
     reasoning_msg = AIMessage(
         content="",
         additional_kwargs={"reasoning_content": f"【📝 ReCode 规划阶段】\n{code}\n\n"}
@@ -319,8 +330,36 @@ def _extract_func_name_from_traceback() -> str:
     return matches[-1] if matches else "未知函数"
 
 def _replace_function(full_code: str, func_name: str, new_func_code: str) -> str:
-    pattern = rf"(def {func_name}\s*\(.*?\):)(.*?)(?=\ndef |\Z)"
-    return re.sub(pattern, new_func_code, full_code, flags=re.DOTALL)
+    """
+    替换指定函数名的完整定义块。
+    通过按行扫描，确保缩进和嵌套函数不会被误伤。
+    """
+    lines = full_code.split('\n')
+    new_lines = []
+    i = 0
+    n = len(lines)
+    
+    # 匹配 def func_name( 或 def func_name :
+    pattern = re.compile(rf'^\s*def\s+{re.escape(func_name)}\s*\(')
+    
+    while i < n:
+        line = lines[i]
+        if pattern.match(line):
+            # 找到目标函数，开始替换
+            new_lines.append(new_func_code)
+            # 跳过原函数的所有行（直到遇到同级或更高级的 def，或者文件结束）
+            i += 1
+            while i < n:
+                next_line = lines[i]
+                # 如果遇到新的 def，且缩进不大于当前函数，则停止跳过
+                if re.match(r'^\s*def\s+\w+', next_line):
+                    break
+                i += 1
+        else:
+            new_lines.append(line)
+            i += 1
+            
+    return '\n'.join(new_lines)
 
 async def recode_executor_node(state: ReCodeState):
     llm = get_llm()
@@ -330,6 +369,8 @@ async def recode_executor_node(state: ReCodeState):
     step = 0
     final_output = ""
     
+    tool_descriptions = "\n".join([f"- {t.name}: {t.description}" for t in tools_list])
+
     while step < max_steps:
         step += 1
         try:
@@ -345,8 +386,10 @@ async def recode_executor_node(state: ReCodeState):
             func_name = _extract_func_name_from_traceback()
             trace += f"\n🔍 第 {step} 次执行触发占位符: `{func_name}()`，开始递归分解...\n"
             
-            # 去掉了 markdown 代码块标记，避免字符串转义冲突
             prompt = f"""你正在递归分解一个 Python 函数。
+可用工具（请直接调用这些工具，禁止使用 import）：
+{tool_descriptions}
+
 当前代码:
 {code}
 
