@@ -1,34 +1,17 @@
-import os
-import json
-from contextlib import asynccontextmanager
+# 导入处修改
+from agent import build_chat_graph, build_react_graph, build_plan_act_graph, build_rewoo_graph
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
-from langchain_core.messages import HumanMessage
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-
-# 导入所有的图构建函数
-from agent import build_chat_graph, build_react_graph, build_plan_act_graph
-
-class UTF8JSONResponse(JSONResponse):
-    media_type = "application/json; charset=utf-8"
-
-DB_PATH = "./checkpoints.db"
-checkpointer = None
-graphs = {}
-
+# 在 lifespan 中注册
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global checkpointer, graphs
     async with AsyncSqliteSaver.from_conn_string(DB_PATH) as saver:
         await saver.setup()
         checkpointer = saver
-        # 初始化三种模式的图
         graphs["chat"] = build_chat_graph(checkpointer)
         graphs["react"] = build_react_graph(checkpointer)
         graphs["plan_act"] = build_plan_act_graph(checkpointer)
+        graphs["rewoo"] = build_rewoo_graph(checkpointer)  # <-- 新增
         yield
 
 app = FastAPI(title="LangGraph Agent API", lifespan=lifespan, default_response_class=UTF8JSONResponse)

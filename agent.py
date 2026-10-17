@@ -153,3 +153,99 @@ def build_plan_act_graph(checkpointer):
     workflow.add_edge("finalizer", END)
     
     return workflow.compile(checkpointer=checkpointer)
+
+# ================= 6. 构建 ReWOO 图 =================
+# ReWOO: 规划器生成所有工具调用计划 -> 执行器依次执行 -> 解决器汇总生成回答
+
+class ReWOOState(TypedDict):
+    messages: Annotated[list[BaseMessage], add_messages]
+    plan: list[dict]     # 规划步骤，例如 [{"tool": "get_weather", "args": {"city": "北京"}}]
+    evidences: str       # 工具执行结果集合
+
+async def rewoo_planner_node(state: ReWOOState):
+    llm = get_llm()
+    prompt = f"""你是任务规划专家。请根据用户的问题，制定一个最多包含3个步骤的执行计划。
+可用工具：
+- calculate(expression: str) # 数学计算
+- get_weather(city: str)     # 查天气
+
+请直接输出严格的 JSON 格式，不要输出其他内容。格式如下：
+{{
+  "plan": [
+    {{"tool": "get_weather", "args": {{"city": "北京"}}}},
+    {{"tool": "calculate", "args": {{"expression": "22 + 5"}}}}
+  ]
+}}
+如果不需要使用工具，请返回: {{"plan": []}}
+
+用户问题: {state['messages'][-1].content}
+"""
+    res = await llm.ainvoke([HumanMessage(content=prompt)])
+    
+    # 解析 JSON
+    try:
+        text = res.content.strip()
+        if text.startswith("```json"): text = text[7:-3]
+        if text.startswith("```"): text = text[3:-3]
+        data = json.loads(text)
+        plan = data.get("plan", [])
+    except:
+        plan = []
+    
+    reasoning_msg = AIMessage(
+        content="",
+        additional_kwargs={"reasoning_content": f"【🧠 ReWOO 规划阶段】\n生成的计划:\n{json.dumps(plan, ensure_ascii=False, indent=2)}\n\n"}
+    )
+    return {"plan": plan, "messages": [reasoning_msg]}
+
+async def rewoo_worker_node(state: ReWOOState):
+    # 依次执行计划中的工具
+    evidences = []
+    for i, step in enumerate(state["plan"]):
+        tool_name = step.get("tool")
+        args = step.get("args", {})
+        
+        # 找到对应的工具
+        target_tool = next((t for t in tools_list if t.name == tool_name), None)
+        if target_tool:
+            try:
+                result = target_tool.invoke(args)
+            except Exception as e:
+                result = f"执行失败: {str(e)}"
+        else:
+            result = f"未找到工具 {tool_name}"
+            
+        evidences.append(f"#E{i+1}: 调用 {tool_name}({json.dumps(args, ensure_ascii=False)}) 返回 -> {result}")
+
+    evidence_str = "\n".join(evidences) if evidences else "无工具调用。"
+    
+    reasoning_msg = AIMessage(
+        content="",
+        additional_kwargs={"reasoning_content": f"【⚙️ ReWOO 执行阶段】\n{evidence_str}\n\n"}
+    )
+    return {"evidences": evidence_str, "messages": [reasoning_msg]}
+
+async def rewoo_solver_node(state: ReWOOState):
+    llm = get_llm()
+    prompt = f"""你是一个聪明的助手。请根据已知的工具执行结果，回答用户的问题。
+
+已知信息:
+{state.get('evidences', '无')}
+
+用户问题: {state['messages'][0].content}
+"""
+    res = await llm.ainvoke([HumanMessage(content=prompt)])
+    return {"messages": [res]}
+
+def build_rewoo_graph(checkpointer):
+    workflow = StateGraph(ReWOOState)
+    workflow.add_node("planner", rewoo_planner_node)
+    workflow.add_node("worker", rewoo_worker_node)
+    workflow.add_node("solver", rewoo_solver_node)
+    
+    workflow.add_edge(START, "planner")
+    workflow.add_edge("planner", "worker")
+    workflow.add_edge("worker", "solver")
+    workflow.add_edge("solver", END)
+    
+    return workflow.compile(checkpointer=checkpointer)
