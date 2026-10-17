@@ -9,81 +9,50 @@ from pydantic import BaseModel
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-from agent import build_graph
-
+# 导入所有的图构建函数
+from agent import build_chat_graph, build_react_graph, build_plan_act_graph
 
 class UTF8JSONResponse(JSONResponse):
     media_type = "application/json; charset=utf-8"
 
-
 DB_PATH = "./checkpoints.db"
 checkpointer = None
-graph = None
-
+graphs = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global checkpointer, graph
+    global checkpointer, graphs
     async with AsyncSqliteSaver.from_conn_string(DB_PATH) as saver:
         await saver.setup()
         checkpointer = saver
-        graph = build_graph(checkpointer)
+        # 初始化三种模式的图
+        graphs["chat"] = build_chat_graph(checkpointer)
+        graphs["react"] = build_react_graph(checkpointer)
+        graphs["plan_act"] = build_plan_act_graph(checkpointer)
         yield
 
-
-app = FastAPI(
-    title="LangGraph Agent API",
-    lifespan=lifespan,
-    default_response_class=UTF8JSONResponse,
-)
-
+app = FastAPI(title="LangGraph Agent API", lifespan=lifespan, default_response_class=UTF8JSONResponse)
 
 class ChatRequest(BaseModel):
     message: str
     thread_id: str
+    mode: str = "chat"  # 默认 chat，可选 react, plan_act
 
-
-class ChatResponse(BaseModel):
-    thread_id: str
-    reply: str
-    message_count: int
-
-
-# ---------- 原接口：一次性返回 ----------
-@app.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest):
-    if graph is None:
-        raise HTTPException(status_code=500, detail="Agent graph not initialized")
-    try:
-        result = await graph.ainvoke(
-            {"messages": [HumanMessage(content=req.message)]},
-            config={"configurable": {"thread_id": req.thread_id}},
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-    last = result["messages"][-1]
-    return ChatResponse(
-        thread_id=req.thread_id,
-        reply=last.content,
-        message_count=len(result["messages"]),
-    )
-
-
-# ---------- 流式输出：区分 reasoning_content 和 content ----------
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest):
-    if graph is None:
-        raise HTTPException(status_code=500, detail="Agent graph not initialized")
+    graph = graphs.get(req.mode)
+    if not graph:
+        raise HTTPException(status_code=400, detail="Unknown mode")
 
     async def event_generator():
         try:
+            # 统一使用 stream_mode="messages"
             async for chunk, _meta in graph.astream(
                 {"messages": [HumanMessage(content=req.message)]},
                 config={"configurable": {"thread_id": req.thread_id}},
                 stream_mode="messages",
             ):
-                # ---- 提取思考过程 ----
+                # 1. 提取思考过程 (DeepSeek 原生或者 Plan-Act 模拟的)
                 reasoning = ""
                 if hasattr(chunk, "additional_kwargs"):
                     reasoning = chunk.additional_kwargs.get("reasoning_content", "") or ""
@@ -92,14 +61,26 @@ async def chat_stream(req: ChatRequest):
                     payload = json.dumps({"type": "reasoning", "delta": reasoning}, ensure_ascii=False)
                     yield f"data: {payload}\n\n"
 
-                # ---- 提取最终回答 ----
+                # 2. 拦截工具调用事件 (ReAct 模式特有)
+                if hasattr(chunk, "tool_calls") and chunk.tool_calls:
+                    for tc in chunk.tool_calls:
+                        msg = f"\n🛠️ [调用工具] {tc['name']}({json.dumps(tc['args'], ensure_ascii=False)})\n"
+                        payload = json.dumps({"type": "reasoning", "delta": msg}, ensure_ascii=False)
+                        yield f"data: {payload}\n\n"
+
+                # 3. 拦截工具执行结果 (ToolMessage)
+                if getattr(chunk, "type", "") == "tool":
+                    msg = f"👉 [工具返回] {chunk.content}\n\n"
+                    payload = json.dumps({"type": "reasoning", "delta": msg}, ensure_ascii=False)
+                    yield f"data: {payload}\n\n"
+
+                # 4. 最终回答文本
                 content = getattr(chunk, "content", "") or ""
                 if content:
                     payload = json.dumps({"type": "content", "delta": content}, ensure_ascii=False)
                     yield f"data: {payload}\n\n"
 
             yield f"data: {json.dumps({'done': True})}\n\n"
-
         except Exception as e:
             payload = json.dumps({"error": str(e)}, ensure_ascii=False)
             yield f"data: {payload}\n\n"
@@ -107,13 +88,8 @@ async def chat_stream(req: ChatRequest):
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream; charset=utf-8",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
-
 
 # ---------- 历史查询：同时返回 reasoning_content ----------
 @app.get("/history/{thread_id}")
